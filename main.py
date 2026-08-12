@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, Literal
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
+from typing import Optional, Dict
 
 app = FastAPI()
 
@@ -14,6 +15,7 @@ REQUIRED_LABELS = {
 ALLOWED_BACKENDS = {"gcs", "s3", "azurerm", "remote"}
 STATEFUL_TYPES = {"storage_bucket", "sql_database", "persistent_disk"}
 
+# Pydantic models for schema validation
 class Resource(BaseModel):
     address: str
     type: str
@@ -34,55 +36,99 @@ class PlanRequest(BaseModel):
     resource: Resource
 
 def validate_provider_version(version: str) -> bool:
-    """Check if provider version is properly pinned."""
-    # Allowed: exact version (6.2.1 or = 6.2.1) or pessimistic (~> 6.0)
     if version in ["6.2.1", "= 6.2.1", "~> 6.0"]:
         return True
-    # Reject: >=, *, latest, or anything else
     return False
 
-@app.post("/terraform/plan")
-def terraform_plan(request: PlanRequest):
-    # Rule 1: Type validation (Pydantic handles this automatically)
-    # If we get here, types are correct
-    
-    # Rule 2: Environment must match
-    if request.environment != REQUIRED_ENV:
+def validate_plan(data: dict) -> dict:
+    # Rule 2–8 logic (same as before), but now we assume schema is OK
+    # Environment
+    if data.get("environment") != REQUIRED_ENV:
         return {"decision": "reject", "reason": "ENVIRONMENT_MISMATCH"}
-    
-    # Rule 3: State backend and locking
-    if request.state.backend not in ALLOWED_BACKENDS:
+
+    state = data.get("state")
+    if not isinstance(state, dict):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+    if state.get("backend") not in ALLOWED_BACKENDS:
         return {"decision": "reject", "reason": "STATE_UNSAFE"}
-    if not request.state.locked:
+    if state.get("locked") is not True:
         return {"decision": "reject", "reason": "STATE_UNSAFE"}
-    
-    # Rule 4: Provider version pinning
-    if not validate_provider_version(request.providerVersion):
+
+    provider_version = data.get("providerVersion")
+    if not isinstance(provider_version, str):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+    if not validate_provider_version(provider_version):
         return {"decision": "reject", "reason": "UNPINNED_PROVIDER"}
-    
-    # Rule 5: Labels must match exactly
-    if request.resource.labels != REQUIRED_LABELS:
+
+    destroy_approved = data.get("destroyApproved")
+    if not isinstance(destroy_approved, bool):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    resource = data.get("resource")
+    if not isinstance(resource, dict):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    # Labels
+    labels = resource.get("labels")
+    if not isinstance(labels, dict):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+    if labels != REQUIRED_LABELS:
         return {"decision": "reject", "reason": "MISSING_LABELS"}
-    
-    # Rule 6: Secret must be null or secret://...
-    if request.resource.secret is not None:
-        if not request.resource.secret.startswith("secret://"):
-            return {"decision": "reject", "reason": "PLAINTEXT_SECRET"}
-    
-    # Rule 7: Stateful deletes require approval
-    if request.resource.action == "delete":
-        if request.resource.type in STATEFUL_TYPES:
-            if not request.destroyApproved:
+
+    # Secret
+    secret = resource.get("secret")
+    if secret is not None and not isinstance(secret, str):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+    if secret is not None and not secret.startswith("secret://"):
+        return {"decision": "reject", "reason": "PLAINTEXT_SECRET"}
+
+    # Action and type
+    action = resource.get("action")
+    res_type = resource.get("type")
+    if not isinstance(action, str) or not isinstance(res_type, str):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+
+    # Rule 7: stateful deletes
+    if action == "delete":
+        if res_type in STATEFUL_TYPES:
+            if destroy_approved is not True:
                 return {"decision": "reject", "reason": "DELETE_NOT_APPROVED"}
-    
-    # Rule 8: Production storage_bucket can't use forceDestroy
-    if request.resource.type == "storage_bucket":
-        if request.resource.forceDestroy:
-            return {"decision": "reject", "reason": "FORCE_DESTROY"}
-    
-    # All checks passed
+
+    # Rule 8: forceDestroy
+    force_destroy = resource.get("forceDestroy")
+    if not isinstance(force_destroy, bool):
+        return {"decision": "reject", "reason": "INVALID_PLAN"}
+    if res_type == "storage_bucket" and force_destroy is True:
+        return {"decision": "reject", "reason": "FORCE_DESTROY"}
+
     return {"decision": "approve", "reason": "APPROVE"}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.post("/terraform/plan")
+async def terraform_plan(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=200,
+            content={"decision": "reject", "reason": "INVALID_PLAN"}
+        )
+
+    # Basic top-level type checks (schema validation)
+    if not isinstance(data, dict):
+        return JSONResponse(
+            status_code=200,
+            content={"decision": "reject", "reason": "INVALID_PLAN"}
+        )
+
+    # Check required top-level keys exist with roughly correct types
+    required_keys = ["environment", "state", "providerVersion", "destroyApproved", "resource"]
+    for k in required_keys:
+        if k not in data:
+            return JSONResponse(
+                status_code=200,
+                content={"decision": "reject", "reason": "INVALID_PLAN"}
+            )
+
+    # Now run detailed validation
+    result = validate_plan(data)
+    return JSONResponse(status_code=200, content=result)
